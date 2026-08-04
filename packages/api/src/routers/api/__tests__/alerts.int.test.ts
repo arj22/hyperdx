@@ -1025,7 +1025,10 @@ describe('alerts router', () => {
         ],
       });
 
-      const res = await agent.get(`/alerts/${alertId}/evaluations`).expect(200);
+      const res = await agent
+        .get(`/alerts/${alertId}/evaluations`)
+        .query({ startTime: at(30).getTime(), endTime: now })
+        .expect(200);
 
       expect(res.body.hasMore).toBe(false);
       expect(res.body.data).toHaveLength(2);
@@ -1038,7 +1041,7 @@ describe('alerts router', () => {
       expect(res.body.data[1].state).toBe(AlertState.OK);
     });
 
-    it('paginates with limit + before and reports hasMore', async () => {
+    it('paginates with limit + the nextBefore cursor and reports hasMore', async () => {
       const alertId = await createTileAlert();
       const now = Date.now();
       // Windows aligned to the alert interval cadence (5m apart)
@@ -1055,24 +1058,71 @@ describe('alerts router', () => {
         });
       }
 
+      // Range chosen so the second page's bounded scan reaches startTime
+      // exactly (limit=2 → each page scans (2+1)×5m = 15m of history).
+      const startTime = now - 20 * 60_000;
+      const endTime = now;
+
       const firstPage = await agent
         .get(`/alerts/${alertId}/evaluations`)
-        .query({ limit: 2 })
+        .query({ limit: 2, startTime, endTime })
         .expect(200);
       expect(firstPage.body.data).toHaveLength(2);
       expect(firstPage.body.hasMore).toBe(true);
+      expect(firstPage.body.nextBefore).toBe(windows[1].getTime());
       expect(firstPage.body.data[0].createdAt).toBe(windows[0].toISOString());
 
       const secondPage = await agent
         .get(`/alerts/${alertId}/evaluations`)
         .query({
           limit: 2,
-          before: new Date(firstPage.body.data[1].createdAt).getTime(),
+          startTime,
+          endTime,
+          before: firstPage.body.nextBefore,
         })
         .expect(200);
       expect(secondPage.body.data).toHaveLength(1);
       expect(secondPage.body.hasMore).toBe(false);
+      expect(secondPage.body.nextBefore).toBeUndefined();
       expect(secondPage.body.data[0].createdAt).toBe(windows[2].toISOString());
+    });
+
+    it('scopes results to the requested time range', async () => {
+      const alertId = await createTileAlert();
+      const now = Date.now();
+      const at = (minsAgo: number) => new Date(now - minsAgo * 60_000);
+
+      await AlertHistory.create({
+        alert: alertId,
+        createdAt: at(5),
+        state: AlertState.OK,
+        counts: 0,
+        lastValues: [{ startTime: at(5), count: 0 }],
+      });
+      await AlertHistory.create({
+        alert: alertId,
+        createdAt: at(45),
+        state: AlertState.OK,
+        counts: 0,
+        lastValues: [{ startTime: at(45), count: 0 }],
+      });
+
+      const res = await agent
+        .get(`/alerts/${alertId}/evaluations`)
+        .query({ startTime: at(30).getTime(), endTime: now })
+        .expect(200);
+
+      expect(res.body.data).toHaveLength(1);
+      expect(res.body.data[0].createdAt).toBe(at(5).toISOString());
+      expect(res.body.hasMore).toBe(false);
+    });
+
+    it('accepts a very wide range (span is clamped, not rejected)', async () => {
+      const alertId = await createTileAlert();
+      await agent
+        .get(`/alerts/${alertId}/evaluations`)
+        .query({ startTime: 1, endTime: Date.now() })
+        .expect(200);
     });
 
     it('rejects an out-of-range limit', async () => {
@@ -1080,6 +1130,15 @@ describe('alerts router', () => {
       await agent
         .get(`/alerts/${alertId}/evaluations`)
         .query({ limit: 10_000 })
+        .expect(400);
+    });
+
+    it('rejects startTime >= endTime', async () => {
+      const alertId = await createTileAlert();
+      const now = Date.now();
+      await agent
+        .get(`/alerts/${alertId}/evaluations`)
+        .query({ startTime: now, endTime: now - 60_000 })
         .expect(400);
     });
 

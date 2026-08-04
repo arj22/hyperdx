@@ -1,6 +1,7 @@
 import { ObjectId } from 'mongodb';
 
 import {
+  getAlertEvaluations,
   getAlertTransitionsInRange,
   getRecentAlertHistories,
   getRecentAlertHistoriesBatch,
@@ -483,47 +484,162 @@ describe('alertHistory controller', () => {
       expect(histories[1].state).toBe(AlertState.ERROR);
       expect(histories[1].errors).toHaveLength(1);
     });
+  });
 
-    it('paginates older windows with the before cursor', async () => {
+  describe('getAlertEvaluations', () => {
+    const createAlert = async () => {
       const team = await Team.create({ name: 'Test Team' });
-      const alert = await Alert.create({
+      return Alert.create({
         team: team._id,
         threshold: 100,
         interval: '5m',
         channel: { type: null },
       });
+    };
 
-      const windows = [1, 2, 3, 4].map(
-        i => new Date(Date.now() - i * 5 * 60000),
-      );
+    const createOkWindow = (alertId: any, createdAt: Date) =>
+      AlertHistory.create({
+        alert: alertId,
+        createdAt,
+        state: AlertState.OK,
+        counts: 0,
+        lastValues: [{ startTime: createdAt, count: 0 }],
+      });
+
+    it('only returns windows within [startTime, endTime]', async () => {
+      const alert = await createAlert();
+      const now = Date.now();
+      const at = (minsAgo: number) => new Date(now - minsAgo * 60_000);
+
+      await createOkWindow(alert._id, at(5)); // after endTime
+      await createOkWindow(alert._id, at(15)); // in range
+      await createOkWindow(alert._id, at(20)); // in range
+      await createOkWindow(alert._id, at(40)); // before startTime
+
+      const page = await getAlertEvaluations({
+        alertId: new ObjectId(alert._id),
+        interval: '5m',
+        limit: 10,
+        startTime: at(30),
+        endTime: at(10),
+      });
+
+      expect(page.data).toHaveLength(2);
+      expect(page.data[0].createdAt).toEqual(at(15));
+      expect(page.data[1].createdAt).toEqual(at(20));
+      expect(page.hasMore).toBe(false);
+      expect(page.nextBefore).toBeUndefined();
+    });
+
+    it('paginates older windows via the nextBefore cursor when the page fills up', async () => {
+      const alert = await createAlert();
+      const now = Date.now();
+      const windows = [1, 2, 3, 4].map(i => new Date(now - i * 5 * 60_000));
       for (const createdAt of windows) {
-        await AlertHistory.create({
-          alert: alert._id,
-          createdAt,
-          state: AlertState.OK,
-          counts: 0,
-          lastValues: [{ startTime: createdAt, count: 0 }],
-        });
+        await createOkWindow(alert._id, createdAt);
       }
 
-      const firstPage = await getRecentAlertHistories({
-        alertId: new ObjectId(alert._id),
-        interval: '5m',
-        limit: 2,
-      });
-      expect(firstPage).toHaveLength(2);
-      expect(firstPage[0].createdAt).toEqual(windows[0]);
-      expect(firstPage[1].createdAt).toEqual(windows[1]);
+      const startTime = new Date(now - 60 * 60_000);
+      const endTime = new Date(now);
 
-      const secondPage = await getRecentAlertHistories({
+      const firstPage = await getAlertEvaluations({
         alertId: new ObjectId(alert._id),
         interval: '5m',
         limit: 2,
-        before: firstPage[1].createdAt,
+        startTime,
+        endTime,
       });
-      expect(secondPage).toHaveLength(2);
-      expect(secondPage[0].createdAt).toEqual(windows[2]);
-      expect(secondPage[1].createdAt).toEqual(windows[3]);
+      expect(firstPage.data).toHaveLength(2);
+      expect(firstPage.data[0].createdAt).toEqual(windows[0]);
+      expect(firstPage.data[1].createdAt).toEqual(windows[1]);
+      expect(firstPage.hasMore).toBe(true);
+      expect(firstPage.nextBefore).toEqual(windows[1]);
+
+      const secondPage = await getAlertEvaluations({
+        alertId: new ObjectId(alert._id),
+        interval: '5m',
+        limit: 2,
+        startTime,
+        endTime,
+        before: firstPage.nextBefore,
+      });
+      expect(secondPage.data).toHaveLength(2);
+      expect(secondPage.data[0].createdAt).toEqual(windows[2]);
+      expect(secondPage.data[1].createdAt).toEqual(windows[3]);
+    });
+
+    it('keeps paging across gaps: the scan bound truncates but nextBefore advances', async () => {
+      const alert = await createAlert();
+      const now = Date.now();
+      const at = (minsAgo: number) => new Date(now - minsAgo * 60_000);
+
+      // One recent window, then a gap far wider than the per-request scan
+      // bound ((limit + 1) × interval = 3 minutes for limit=2 / 1m interval),
+      // then an old window still inside the requested range.
+      await createOkWindow(alert._id, at(1));
+      await createOkWindow(alert._id, at(20));
+
+      const startTime = at(30);
+      const endTime = at(0);
+
+      // First page: finds the recent window; the scan bound stops long
+      // before startTime, so more may exist.
+      const firstPage = await getAlertEvaluations({
+        alertId: new ObjectId(alert._id),
+        interval: '1m',
+        limit: 2,
+        startTime,
+        endTime,
+      });
+      expect(firstPage.data).toHaveLength(1);
+      expect(firstPage.data[0].createdAt).toEqual(at(1));
+      expect(firstPage.hasMore).toBe(true);
+      expect(firstPage.nextBefore).toBeDefined();
+
+      // Follow the cursor until the old window is found or the range is
+      // exhausted. Every hop advances by at least one scan bound, so this
+      // terminates.
+      let before = firstPage.nextBefore;
+      let found: Date | undefined;
+      for (let i = 0; i < 20 && before != null; i++) {
+        const page = await getAlertEvaluations({
+          alertId: new ObjectId(alert._id),
+          interval: '1m',
+          limit: 2,
+          startTime,
+          endTime,
+          before,
+        });
+        if (page.data.length > 0) {
+          found = page.data[0].createdAt;
+          break;
+        }
+        expect(page.hasMore).toBe(true);
+        // Empty pages still advance the cursor
+        expect(page.nextBefore!.getTime()).toBeLessThan(before.getTime());
+        before = page.nextBefore;
+      }
+      expect(found).toEqual(at(20));
+    });
+
+    it('reports hasMore=false once the scan reaches startTime', async () => {
+      const alert = await createAlert();
+      const now = Date.now();
+      const at = (minsAgo: number) => new Date(now - minsAgo * 60_000);
+
+      await createOkWindow(alert._id, at(5));
+
+      const page = await getAlertEvaluations({
+        alertId: new ObjectId(alert._id),
+        interval: '5m',
+        limit: 10,
+        startTime: at(20),
+        endTime: at(0),
+      });
+
+      expect(page.data).toHaveLength(1);
+      expect(page.hasMore).toBe(false);
+      expect(page.nextBefore).toBeUndefined();
     });
   });
 

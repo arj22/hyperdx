@@ -8,6 +8,13 @@ import { fireEvent, screen } from '@testing-library/react';
 
 import { AlertEvaluationsTable } from '@/components/alerts/AlertEvaluationsTable';
 
+// Controls whether the infinite-scroll sentinel reports itself as visible.
+let mockInViewport = false;
+jest.mock('@mantine/hooks', () => ({
+  ...jest.requireActual('@mantine/hooks'),
+  useInViewport: () => ({ ref: jest.fn(), inViewport: mockInViewport }),
+}));
+
 const okWindow: AlertHistory = {
   counts: 0,
   createdAt: '2026-04-17T12:05:00.000Z',
@@ -45,6 +52,10 @@ const renderTable = (
   );
 
 describe('AlertEvaluationsTable', () => {
+  beforeEach(() => {
+    mockInViewport = false;
+  });
+
   it('renders one row per evaluation window with state badges', () => {
     renderTable();
 
@@ -71,19 +82,36 @@ describe('AlertEvaluationsTable', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders a load-more button when older pages exist', () => {
+  it('fetches the next page when the scroll sentinel enters the viewport', () => {
+    mockInViewport = true;
     const onLoadMore = jest.fn();
     renderTable({ hasNextPage: true, onLoadMore });
 
-    const button = screen.getByRole('button', {
-      name: /Load older evaluations/,
-    });
-    fireEvent.click(button);
+    expect(
+      screen.getByTestId('alert-evaluations-load-more'),
+    ).toBeInTheDocument();
     expect(onLoadMore).toHaveBeenCalled();
   });
 
-  it('renders an empty state when there are no evaluations', () => {
+  it('does not fetch while a page is already being fetched', () => {
+    mockInViewport = true;
+    const onLoadMore = jest.fn();
+    renderTable({ hasNextPage: true, isFetchingNextPage: true, onLoadMore });
+
+    expect(onLoadMore).not.toHaveBeenCalled();
+  });
+
+  it('does not render the sentinel when there are no older pages', () => {
+    renderTable({ hasNextPage: false });
+    expect(
+      screen.queryByTestId('alert-evaluations-load-more'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('renders an empty state when the range has no evaluations', () => {
     renderTable({ evaluations: [] });
-    expect(screen.getByText(/No evaluations recorded yet/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/No evaluations in the selected time range/),
+    ).toBeInTheDocument();
   });
 });

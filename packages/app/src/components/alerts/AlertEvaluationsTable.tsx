@@ -2,14 +2,15 @@ import * as React from 'react';
 import { AlertHistory, AlertState } from '@hyperdx/common-utils/dist/types';
 import {
   Badge,
-  Button,
   Center,
   Group,
+  Loader,
   Skeleton,
   Table,
   Text,
   UnstyledButton,
 } from '@mantine/core';
+import { useInViewport } from '@mantine/hooks';
 import { IconChevronDown } from '@tabler/icons-react';
 
 import {
@@ -122,8 +123,41 @@ function EvaluationRow({ history }: { history: AlertHistory }) {
 }
 
 /**
+ * Sentinel row at the bottom of the event stream: when scrolled into view
+ * (and older pages exist), it triggers the next fetch — infinite scroll in
+ * `limit`-sized chunks instead of a manual load-more button.
+ */
+function LoadMoreSentinel({
+  isFetchingNextPage,
+  onLoadMore,
+}: {
+  isFetchingNextPage: boolean;
+  onLoadMore: () => void;
+}) {
+  const { ref, inViewport } = useInViewport();
+
+  React.useEffect(() => {
+    if (inViewport && !isFetchingNextPage) {
+      onLoadMore();
+    }
+  }, [inViewport, isFetchingNextPage, onLoadMore]);
+
+  return (
+    <Center py="sm" ref={ref} data-testid="alert-evaluations-load-more">
+      <Group gap="xs">
+        <Loader size="xs" />
+        <Text size="sm" c="dimmed">
+          Loading older evaluations…
+        </Text>
+      </Group>
+    </Center>
+  );
+}
+
+/**
  * Datadog-style evaluation event stream: one row per evaluation window,
  * newest first, with expandable error details for failed evaluations.
+ * Fetches older windows in pages as the user scrolls to the bottom.
  */
 export function AlertEvaluationsTable({
   evaluations,
@@ -142,12 +176,11 @@ export function AlertEvaluationsTable({
     return <Skeleton h={160} w="100%" />;
   }
 
-  if (evaluations.length === 0) {
+  if (evaluations.length === 0 && !hasNextPage) {
     return (
       <Center py="lg">
         <Text size="sm" c="dimmed">
-          No evaluations recorded yet. Evaluations appear here after the alert
-          runs.
+          No evaluations in the selected time range.
         </Text>
       </Center>
     );
@@ -172,16 +205,10 @@ export function AlertEvaluationsTable({
         </Table.Tbody>
       </Table>
       {hasNextPage && (
-        <Center py="sm">
-          <Button
-            variant="secondary"
-            size="compact-sm"
-            loading={isFetchingNextPage}
-            onClick={onLoadMore}
-          >
-            Load older evaluations
-          </Button>
-        </Center>
+        <LoadMoreSentinel
+          isFetchingNextPage={isFetchingNextPage}
+          onLoadMore={onLoadMore}
+        />
       )}
     </>
   );

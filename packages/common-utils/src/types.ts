@@ -2184,8 +2184,17 @@ export type AlertHistoryRangeApiResponse = z.infer<
 // evaluation window (newest first), including any errors recorded for it.
 export const AlertEvaluationsApiResponseSchema = z.object({
   data: z.array(AlertHistorySchema),
-  /** True when older evaluation windows exist beyond the returned page. */
+  /**
+   * True when older evaluation windows may exist within the requested time
+   * range beyond the returned page.
+   */
   hasMore: z.boolean(),
+  /**
+   * Cursor (epoch ms) for the next-older page: pass as `before` on the next
+   * request. Present when hasMore is true. Cursor-based (not offset-based)
+   * so pages advance even across gaps with no evaluations.
+   */
+  nextBefore: z.number().optional(),
 });
 
 export type AlertEvaluationsApiResponse = z.infer<

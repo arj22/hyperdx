@@ -219,35 +219,37 @@ const api = {
       enabled: enabled && alertId != null,
     });
   },
-  getAlertEvaluationsQueryKey: (alertId: string | undefined, limit?: number) =>
-    ['alertEvaluations', alertId, limit] as const,
-  // Paginated evaluation history for the alert detail page: one entry per
-  // evaluation window (newest first), including errors recorded for it.
-  // Older pages are keyed off the last window's createdAt (`before`).
-  useAlertEvaluations(
+  getAlertEvaluationsQueryKey: (
     alertId: string | undefined,
-    { limit }: { limit?: number } = {},
-  ) {
+    startTime: number,
+    endTime: number,
+  ) => ['alertEvaluations', alertId, startTime, endTime] as const,
+  // Paginated evaluation history for the alert detail page: one entry per
+  // evaluation window (newest first), scoped to the given date range and
+  // including errors recorded for each window. Older pages are keyed off the
+  // server-provided `nextBefore` cursor, which advances even across gaps with
+  // no evaluations. Bounds are quantized to the minute so live ticks don't
+  // produce a new query key on every render.
+  useAlertEvaluations(alertId: string | undefined, dateRange: [Date, Date]) {
+    const BUCKET_MS = 60_000;
+    const startTime =
+      Math.floor(dateRange[0].getTime() / BUCKET_MS) * BUCKET_MS;
+    const endTime = Math.floor(dateRange[1].getTime() / BUCKET_MS) * BUCKET_MS;
     return useInfiniteQuery({
-      queryKey: api.getAlertEvaluationsQueryKey(alertId, limit),
+      queryKey: api.getAlertEvaluationsQueryKey(alertId, startTime, endTime),
       queryFn: ({ pageParam }) =>
         hdxServer(`alerts/${alertId}/evaluations`, {
           method: 'GET',
           searchParams: {
-            ...(limit != null && { limit }),
+            startTime,
+            endTime,
             ...(pageParam != null && { before: pageParam }),
           },
         }).json<AlertEvaluationsApiResponse>(),
       initialPageParam: undefined as number | undefined,
-      getNextPageParam: lastPage => {
-        if (!lastPage.hasMore || lastPage.data.length === 0) {
-          return undefined;
-        }
-        return new Date(
-          lastPage.data[lastPage.data.length - 1].createdAt,
-        ).getTime();
-      },
-      enabled: alertId != null,
+      getNextPageParam: lastPage =>
+        lastPage.hasMore ? lastPage.nextBefore : undefined,
+      enabled: alertId != null && startTime < endTime,
     });
   },
   useServices() {

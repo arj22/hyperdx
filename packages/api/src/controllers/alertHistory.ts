@@ -12,6 +12,11 @@ import AlertHistory, { IAlertHistory } from '@/models/alertHistory';
 // Max parallel per-alert queries to avoid overwhelming the DB connection pool
 export const ALERT_HISTORY_QUERY_CONCURRENCY = 20;
 
+/** Alert evaluation interval in milliseconds. */
+const intervalToMs = (interval: AlertInterval): number =>
+  // eslint-disable-next-line security/detect-object-injection -- interval is a typed AlertInterval union, not user input
+  ALERT_INTERVAL_TO_MINUTES[interval] * 60 * 1000;
+
 type GroupedAlertHistory = {
   _id: Date;
   states: string[];
@@ -76,37 +81,14 @@ function mapGroupedHistories(
 }
 
 /**
- * Gets the most recent alert histories for a given alert ID,
- * limiting to the given number of entries. Results are one entry per
- * evaluation window (grouped by createdAt), newest first.
- *
- * When `before` is provided, only windows strictly older than it are
- * returned — used to paginate the alert detail page's evaluation history.
+ * Fetch grouped evaluation windows (one entry per createdAt, newest first)
+ * for the given alert within the createdAt bounds, capped at `limit` groups.
  */
-export async function getRecentAlertHistories({
-  alertId,
-  interval,
-  limit,
-  before,
-}: {
-  alertId: ObjectId;
-  interval: AlertInterval;
-  limit: number;
-  before?: Date;
-}): Promise<Omit<IAlertHistory, 'alert'>[]> {
-  // One extra interval of slack so a window sitting exactly `limit` intervals
-  // back (the newest window is up to one interval old) isn't cut off by the
-  // lookback bound.
-  const lookbackMs =
-    (limit + 1) * ALERT_INTERVAL_TO_MINUTES[interval] * 60 * 1000;
-  const endTime = before ?? new Date();
-  const createdAt: Record<string, Date> = {
-    $gte: new Date(endTime.getTime() - lookbackMs),
-  };
-  if (before != null) {
-    createdAt.$lt = before;
-  }
-
+async function fetchGroupedWindows(
+  alertId: ObjectId,
+  createdAt: Record<string, Date>,
+  limit: number,
+): Promise<Omit<IAlertHistory, 'alert'>[]> {
   const groupedHistories = await AlertHistory.aggregate<GroupedAlertHistory>([
     {
       $match: {
@@ -143,6 +125,115 @@ export async function getRecentAlertHistories({
   ]);
 
   return mapGroupedHistories(groupedHistories);
+}
+
+/**
+ * Gets the most recent alert histories for a given alert ID,
+ * limiting to the given number of entries. Results are one entry per
+ * evaluation window (grouped by createdAt), newest first.
+ */
+export async function getRecentAlertHistories({
+  alertId,
+  interval,
+  limit,
+}: {
+  alertId: ObjectId;
+  interval: AlertInterval;
+  limit: number;
+}): Promise<Omit<IAlertHistory, 'alert'>[]> {
+  // One extra interval of slack so a window sitting exactly `limit` intervals
+  // back (the newest window is up to one interval old) isn't cut off by the
+  // lookback bound.
+  const lookbackMs = (limit + 1) * intervalToMs(interval);
+  return fetchGroupedWindows(
+    alertId,
+    { $gte: new Date(Date.now() - lookbackMs) },
+    limit,
+  );
+}
+
+export type AlertEvaluationsPage = {
+  data: Omit<IAlertHistory, 'alert'>[];
+  /** True when older windows may exist within [startTime, ...). */
+  hasMore: boolean;
+  /** Cursor for the next-older page (pass as `before`). Set when hasMore. */
+  nextBefore?: Date;
+};
+
+/**
+ * Paginated evaluation windows for the alert detail page, newest first,
+ * scoped to [startTime, endTime].
+ *
+ * Every request scans a hard-bounded slice of at most ~(limit + 1) intervals
+ * of history (anchored at `before ?? endTime`), so a wide time range can
+ * never force an unbounded scan — group-by alerts can have many rows per
+ * window, and the $group stage processes every matched row.
+ *
+ * Because of that bound, a page may end before reaching `startTime` even if
+ * fewer than `limit` windows were returned (a gap with no evaluations). The
+ * returned `nextBefore` cursor always advances past the scanned slice, so
+ * callers can keep paging across gaps: pass it as `before` on the next call.
+ */
+export async function getAlertEvaluations({
+  alertId,
+  interval,
+  limit,
+  startTime,
+  endTime,
+  before,
+}: {
+  alertId: ObjectId;
+  interval: AlertInterval;
+  limit: number;
+  startTime: Date;
+  endTime: Date;
+  before?: Date;
+}): Promise<AlertEvaluationsPage> {
+  const intervalMs = intervalToMs(interval);
+  // One extra interval of slack so a window sitting exactly `limit` intervals
+  // back isn't cut off by the scan bound.
+  const scanMs = (limit + 1) * intervalMs;
+
+  // Upper bound: the page cursor when provided (exclusive), else the range
+  // end (inclusive). A cursor past the range end is ignored.
+  const usableBefore =
+    before != null && before.getTime() <= endTime.getTime()
+      ? before
+      : undefined;
+  const pageEndMs = usableBefore?.getTime() ?? endTime.getTime();
+
+  // Lower bound: the scan bound, clamped to the requested range start.
+  const scanFloorMs = Math.max(startTime.getTime(), pageEndMs - scanMs);
+
+  const createdAt: Record<string, Date> = {
+    $gte: new Date(scanFloorMs),
+  };
+  if (usableBefore != null) {
+    createdAt.$lt = usableBefore;
+  } else {
+    createdAt.$lte = endTime;
+  }
+
+  // Fetch one extra window to detect count truncation.
+  const windows = await fetchGroupedWindows(alertId, createdAt, limit + 1);
+
+  const truncatedByCount = windows.length > limit;
+  const data = truncatedByCount ? windows.slice(0, limit) : windows;
+  // More windows may exist when the page filled up, or when the scan bound
+  // stopped before reaching the range start.
+  const truncatedByScanBound = scanFloorMs > startTime.getTime();
+  const hasMore = truncatedByCount || truncatedByScanBound;
+
+  // Count truncation: resume strictly before the last returned window.
+  // Scan-bound truncation: the slice down to scanFloor (inclusive) is fully
+  // covered, so resume strictly before it.
+  const nextBefore = !hasMore
+    ? undefined
+    : truncatedByCount
+      ? data[data.length - 1].createdAt
+      : new Date(scanFloorMs);
+
+  return { data, hasMore, nextBefore };
 }
 
 /**
@@ -201,7 +292,7 @@ export async function getAlertTransitionsInRange({
   startTime: Date;
   endTime: Date;
 }): Promise<AlertTransition[]> {
-  const intervalMs = ALERT_INTERVAL_TO_MINUTES[interval] * 60 * 1000;
+  const intervalMs = intervalToMs(interval);
   const lookbackStart = new Date(startTime.getTime() - intervalMs);
 
   // Only the per-window state is needed to detect crossings. ERROR rows are

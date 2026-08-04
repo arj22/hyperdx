@@ -123,18 +123,28 @@ function AlertDetailBody({ alert }: { alert: AlertsPageItem }) {
     [searchedTimeRange, alert.interval],
   );
 
+  // The evaluation strip + event stream follow the same range as the chart,
+  // fetched in fixed-size pages as the user scrolls (each page is a hard-
+  // bounded scan server-side, so wide ranges never fetch unbounded history).
   const {
     data: evaluationsData,
     isLoading: isEvaluationsLoading,
     hasNextPage,
     isFetchingNextPage,
     fetchNextPage,
-  } = api.useAlertEvaluations(alert._id);
+  } = api.useAlertEvaluations(alert._id, chartDateRange);
 
   const evaluations = React.useMemo(
     () => evaluationsData?.pages.flatMap(page => page.data) ?? [],
     [evaluationsData],
   );
+
+  // Stable callback so the scroll sentinel's effect doesn't refire on every
+  // render. cancelRefetch:false makes overlapping triggers no-ops instead of
+  // restarting an in-flight page fetch.
+  const onLoadMore = React.useCallback(() => {
+    fetchNextPage({ cancelRefetch: false });
+  }, [fetchNextPage]);
 
   return (
     <>
@@ -208,7 +218,7 @@ function AlertDetailBody({ alert }: { alert: AlertsPageItem }) {
                 isLoading={isEvaluationsLoading}
                 hasNextPage={hasNextPage ?? false}
                 isFetchingNextPage={isFetchingNextPage}
-                onLoadMore={() => fetchNextPage()}
+                onLoadMore={onLoadMore}
               />
             </div>
           </Stack>
