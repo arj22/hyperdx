@@ -1,5 +1,21 @@
 # @hyperdx/app
 
+## 2.38.0
+
+### Minor Changes
+
+- 38e99a37: Add a read-time, schema-agnostic LLM observability dashboard at `/llm` (beta, linked from the dashboards list) — no ingestion changes required, and it works retroactively on already-ingested telemetry. Traces instrumented with the OTel GenAI semantic conventions, OpenLLMetry, OpenInference, or the Vercel AI SDK are interpreted at query time to chart traffic, token split (uncached/cached/cache-write/output/reasoning), estimated cost by model (bundled price catalog with cache-read discounts and cache-write premiums; an instrumentation-provided cost attribute always wins), latency/TTFT, tool analytics, per-session timelines with lazy-loaded conversation views, and side-by-side LLM span/log search. Aggregations elect an app's own cost-reporting spans as the authoritative per-call reporters so apps emitting several instrumentation dialects in parallel (e.g. opencode emitting OpenInference and Vercel AI spans for each call) are counted once — verified to match opencode's self-reported session cost exactly.
+
+### Patch Changes
+
+- b917308d: fix: metric names in the chart editor are now listed deterministically instead of sampled. The dropdown discovered names with `groupUniqArray(3000)(MetricName)`, which keeps an arbitrary subset once a metrics table holds more than 3000 distinct names — the survivors follow hash order, not name order — so metrics that exist and are actively reporting could be unselectable, with no warning and no way to search for what had been dropped. Names are now fetched with an ordered, paginated query and matched server-side, ranked so an exact match is always on the first page, and the dropdown says when the list is incomplete. Also fixes the metric list ignoring the chart's selected time range, which pinned it to the last 24 hours.
+- cff6388c: feat: Add static filters to schemas and APIs
+- Updated dependencies [808b3453]
+- Updated dependencies [b917308d]
+- Updated dependencies [cff6388c]
+  - @hyperdx/api@2.38.0
+  - @hyperdx/common-utils@0.28.1
+
 ## 2.37.0
 
 ### Minor Changes
